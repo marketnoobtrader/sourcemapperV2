@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -378,7 +379,7 @@ func processSourceMap(sm sourceMap, outdir string, concurrency int, verbose bool
 	// Send jobs
 	go func() {
 		for i := 0; i < maxEntries; i++ {
-			sourcePath := sm.Sources[i]
+			sourcePath := normalizeWebpackPath(sm.Sources[i])
 
 			// Sanitize path (remove/replace invalid characters like | : ? * etc)
 			sourcePath = sanitizePath(sourcePath)
@@ -814,4 +815,33 @@ func main() {
 		log.Printf("[+] Total source files extracted: %d", totalProcessed)
 		log.Println("[+] Done")
 	}
+}
+
+func normalizeWebpackPath(p string) string {
+	dir := filepath.Dir(p)
+	base := filepath.Base(p) // App.vue?5d74
+
+	var name, hash string
+	if strings.Contains(base, "?") {
+		split := strings.SplitN(base, "?", 2)
+		name = split[0]
+		hash = split[1]
+	} else {
+		name = base
+	}
+
+	ext := filepath.Ext(name)
+	nameOnly := strings.TrimSuffix(name, ext)
+
+	if hash != "" {
+		base = fmt.Sprintf("%s_%s%s", nameOnly, hash, ext)
+	} else {
+		base = name
+	}
+
+	// GHÉP LẠI path
+	if dir == "." {
+		return base
+	}
+	return filepath.Join(dir, base)
 }
