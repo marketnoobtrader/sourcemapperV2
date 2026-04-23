@@ -57,8 +57,7 @@ type fileWriteResult struct {
 // options represents command line options
 type options struct {
 	Output      string
-	URLs        goflags.StringSlice // Auto-detect .map or .js
-	List        string              // File containing URLs (auto-detect .map or .js)
+	Input       goflags.StringSlice // URLs, files, or list files - auto-detect all
 	Stdin       bool                // Read URLs from stdin for pipeline
 	Proxy       string
 	Timeout     int
@@ -153,14 +152,19 @@ func getSourceMap(source string, client *retryablehttp.Client, headers map[strin
 
 	log.Printf("[+] Retrieving Sourcemap from %.1024s...\n", source)
 
-	u, err := url.ParseRequestURI(source)
-	if err != nil {
-		// If it's a file, read it.
+	// Try local file first
+	if _, statErr := os.Stat(source); statErr == nil {
 		body, err = os.ReadFile(source)
 		if err != nil {
 			return m, err
 		}
 	} else {
+		// Not a local file, try parsing as URL
+		u, err := url.ParseRequestURI(source)
+		if err != nil {
+			return m, err
+		}
+
 		if u.Scheme == "http" || u.Scheme == "https" {
 			// If it's a URL, get it.
 			req, err := retryablehttp.NewRequest("GET", u.String(), nil)
@@ -202,11 +206,7 @@ func getSourceMap(source string, client *retryablehttp.Client, headers map[strin
 
 			body = []byte(data)
 		} else {
-			// If it's a file, read it.
-			body, err = os.ReadFile(source)
-			if err != nil {
-				return m, err
-			}
+			return m, errors.New("unsupported URL scheme: " + u.Scheme)
 		}
 	}
 
@@ -225,7 +225,7 @@ func getSourceMap(source string, client *retryablehttp.Client, headers map[strin
 // getSourceMapFromJS queries a JavaScript URL, parses its headers and content and looks for sourcemaps
 // follows the rules outlined in https://tc39.es/source-map-spec/#linking-generated-code
 func getSourceMapFromJS(jsurl string, client *retryablehttp.Client, headers map[string]string) (m sourceMap, err error) {
-	log.Printf("[+] Retrieving JavaScript from URL: %s.\n", jsurl)
+	log.Printf("[+] Retrieving JavaScript from URL: %s\n", jsurl)
 
 	// perform the request
 	u, err := url.ParseRequestURI(jsurl)
@@ -437,6 +437,57 @@ func sanitizePath(p string) string {
 	return p
 }
 
+// isListFile checks if a file looks like a list file (text file with URLs)
+func isListFile(path string) bool {
+	// Check if file exists
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+
+	// If extension suggests it's a list file
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".txt" || ext == ".lst" {
+		return true
+	}
+
+	// If no extension and filename suggests list
+	if ext == "" && (strings.Contains(path, "list") || strings.Contains(path, "urls")) {
+		return true
+	}
+
+	// Otherwise, try to detect by content - read first few lines
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	lineCount := 0
+	urlCount := 0
+
+	for scanner.Scan() && lineCount < 10 {
+		line := strings.TrimSpace(scanner.Text())
+		lineCount++
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Check if line looks like URL or file path
+		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") ||
+			strings.HasSuffix(line, ".map") || strings.HasSuffix(line, ".map.json") ||
+			strings.HasSuffix(line, ".js") {
+			urlCount++
+		}
+	}
+
+	// If most lines look like URLs, treat as list file
+	return urlCount >= 2 || (lineCount > 0 && urlCount == lineCount)
+}
+
 // readURLsFromFile reads URLs from file and categorizes them
 func readURLsFromFile(filename string) (mapURLs []string, jsURLs []string, err error) {
 	file, err := os.Open(filename)
@@ -458,7 +509,7 @@ func readURLsFromFile(filename string) (mapURLs []string, jsURLs []string, err e
 		}
 
 		// Auto-detect based on extension or pattern
-		if strings.HasSuffix(line, ".map") || strings.Contains(line, ".map?") {
+		if strings.HasSuffix(line, ".map") || strings.HasSuffix(line, ".map.json") || strings.Contains(line, ".map?") {
 			// Sourcemap URL
 			mapURLs = append(mapURLs, line)
 		} else if strings.HasSuffix(line, ".js") || strings.Contains(line, ".js?") {
@@ -486,7 +537,7 @@ func readURLsFromFile(filename string) (mapURLs []string, jsURLs []string, err e
 func categorizeURLs(urls []string) (mapURLs []string, jsURLs []string) {
 	for _, u := range urls {
 		// Auto-detect based on extension or pattern
-		if strings.HasSuffix(u, ".map") || strings.Contains(u, ".map?") {
+		if strings.HasSuffix(u, ".map") || strings.HasSuffix(u, ".map.json") || strings.Contains(u, ".map?") {
 			mapURLs = append(mapURLs, u)
 		} else if strings.HasSuffix(u, ".js") || strings.Contains(u, ".js?") {
 			jsURLs = append(jsURLs, u)
@@ -541,6 +592,37 @@ func deduplicateURLs(urls []string) []string {
 	return unique
 }
 
+// processInput handles all input sources and returns categorized URLs
+func processInput(inputs []string, silent bool) (mapURLs []string, jsURLs []string, err error) {
+	var allMapURLs []string
+	var allJsURLs []string
+
+	for _, input := range inputs {
+		// Check if input is a list file
+		if isListFile(input) {
+			mapURLsFromFile, jsURLsFromFile, err := readURLsFromFile(input)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			allMapURLs = append(allMapURLs, mapURLsFromFile...)
+			allJsURLs = append(allJsURLs, jsURLsFromFile...)
+
+			if !silent {
+				log.Printf("[+] Loaded %d URLs from list file %s (%d sourcemaps, %d JavaScript)\n",
+					len(mapURLsFromFile)+len(jsURLsFromFile), input, len(mapURLsFromFile), len(jsURLsFromFile))
+			}
+		} else {
+			// Treat as direct URL/path
+			mapURLsDirect, jsURLsDirect := categorizeURLs([]string{input})
+			allMapURLs = append(allMapURLs, mapURLsDirect...)
+			allJsURLs = append(allJsURLs, jsURLsDirect...)
+		}
+	}
+
+	return allMapURLs, allJsURLs, nil
+}
+
 func main() {
 	opts := &options{}
 
@@ -548,8 +630,7 @@ func main() {
 	flagSet.SetDescription("Extract source code from JavaScript sourcemaps")
 
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringSliceVarP(&opts.URLs, "url", "u", nil, "URL/path (auto-detects .map or .js, comma-separated)", goflags.CommaSeparatedStringSliceOptions),
-		flagSet.StringVarP(&opts.List, "list", "l", "", "file containing URLs (auto-detects .map or .js)"),
+		flagSet.StringSliceVarP(&opts.Input, "input", "i", nil, "URLs, paths, or list files (auto-detects, comma-separated)", goflags.CommaSeparatedStringSliceOptions),
 		flagSet.BoolVar(&opts.Stdin, "stdin", false, "read URLs from stdin (for pipeline)"),
 	)
 
@@ -588,51 +669,43 @@ func main() {
 			log.Fatalf("Error reading URLs from stdin: %v", err)
 		}
 
-		opts.URLs = append(opts.URLs, stdinURLs...)
+		opts.Input = append(opts.Input, stdinURLs...)
 
 		if !opts.Silent && len(stdinURLs) > 0 {
 			log.Printf("[+] Loaded %d URLs from stdin\n", len(stdinURLs))
 		}
 	}
 
-	// Read URLs from file if provided
-	if opts.List != "" {
-		mapURLs, jsURLs, err := readURLsFromFile(opts.List)
-		if err != nil {
-			log.Fatalf("Error reading URLs from file: %v", err)
-		}
-
-		// Append to existing URLs
-		opts.URLs = append(opts.URLs, mapURLs...)
-		opts.URLs = append(opts.URLs, jsURLs...)
-
-		if !opts.Silent {
-			log.Printf("[+] Loaded %d URLs from %s (%d sourcemaps, %d JavaScript)\n",
-				len(mapURLs)+len(jsURLs), opts.List, len(mapURLs), len(jsURLs))
-		}
+	if len(opts.Input) == 0 {
+		log.Fatal("at least one -input or -stdin is required")
 	}
 
-	if len(opts.URLs) == 0 {
-		log.Fatal("at least one -url, -list, or -stdin is required")
+	// Process all input sources
+	mapURLs, jsURLs, err := processInput(opts.Input, opts.Silent)
+	if err != nil {
+		log.Fatalf("Error processing input: %v", err)
+	}
+
+	if len(mapURLs) == 0 && len(jsURLs) == 0 {
+		log.Fatal("no valid URLs/paths found in input")
 	}
 
 	// Deduplicate URLs
-	originalCount := len(opts.URLs)
-	opts.URLs = deduplicateURLs(opts.URLs)
-	if !opts.Silent && originalCount != len(opts.URLs) {
-		log.Printf("[+] Removed %d duplicate URLs\n", originalCount-len(opts.URLs))
+	allURLs := append(mapURLs, jsURLs...)
+	originalCount := len(allURLs)
+	mapURLs = deduplicateURLs(mapURLs)
+	jsURLs = deduplicateURLs(jsURLs)
+
+	if !opts.Silent && originalCount != (len(mapURLs)+len(jsURLs)) {
+		log.Printf("[+] Removed %d duplicate URLs\n", originalCount-(len(mapURLs)+len(jsURLs)))
 	}
 
-	// Auto-categorize URLs into sourcemaps and JavaScript
-	mapURLs, jsURLs := categorizeURLs(opts.URLs)
-
 	if !opts.Silent && (len(mapURLs) > 0 || len(jsURLs) > 0) {
-		log.Printf("[+] Auto-detected: %d sourcemap URLs, %d JavaScript URLs\n", len(mapURLs), len(jsURLs))
+		log.Printf("[+] Total: %d sourcemap URLs, %d JavaScript URLs\n", len(mapURLs), len(jsURLs))
 	}
 
 	// Parse proxy URL
 	var proxyURL *url.URL
-	var err error
 	if opts.Proxy != "" {
 		proxyURL, err = url.Parse(opts.Proxy)
 		if err != nil {
