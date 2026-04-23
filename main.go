@@ -57,7 +57,8 @@ type fileWriteResult struct {
 // options represents command line options
 type options struct {
 	Output      string
-	Input       goflags.StringSlice // URLs, files, or list files - auto-detect all
+	URLs        goflags.StringSlice // URLs, paths, or list files - auto-detect all
+	List        string              // File containing URLs (for compatibility)
 	Stdin       bool                // Read URLs from stdin for pipeline
 	Proxy       string
 	Timeout     int
@@ -630,8 +631,8 @@ func main() {
 	flagSet.SetDescription("Extract source code from JavaScript sourcemaps")
 
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringSliceVarP(&opts.Input, "input", "i", nil, "URLs, paths, or list files (auto-detects, comma-separated)", goflags.CommaSeparatedStringSliceOptions),
-		flagSet.BoolVar(&opts.Stdin, "stdin", false, "read URLs from stdin (for pipeline)"),
+		flagSet.StringSliceVarP(&opts.URLs, "url", "u", nil, "URL/path to .map/.js file or list file (comma-separated)", goflags.CommaSeparatedStringSliceOptions),
+		flagSet.StringVarP(&opts.List, "list", "l", "", "file containing URLs (one per line)"),
 	)
 
 	flagSet.CreateGroup("output", "Output",
@@ -643,9 +644,9 @@ func main() {
 		flagSet.IntVarP(&opts.Timeout, "timeout", "t", 30, "request timeout in seconds"),
 		flagSet.IntVarP(&opts.Retries, "retries", "r", 3, "number of retries"),
 		flagSet.IntVarP(&opts.RateLimit, "rate-limit", "rl", 0, "requests per second (0 = unlimited)"),
-		flagSet.IntVarP(&opts.Concurrency, "concurrency", "c", 5, "concurrent requests"),
+		flagSet.IntVarP(&opts.Concurrency, "concurrency", "c", 5, "concurrent file writes"),
 		flagSet.BoolVarP(&opts.Insecure, "insecure", "k", true, "skip TLS verification"),
-		flagSet.StringSliceVarP(&opts.Headers, "header", "H", nil, "HTTP header (comma-separated or multiple flags)", goflags.CommaSeparatedStringSliceOptions),
+		flagSet.StringSliceVarP(&opts.Headers, "header", "H", nil, "custom HTTP headers (can be used multiple times)", goflags.CommaSeparatedStringSliceOptions),
 	)
 
 	flagSet.CreateGroup("debug", "Debug",
@@ -659,29 +660,25 @@ func main() {
 
 	// Validation
 	if opts.Output == "" {
-		log.Fatal("output directory is required")
+		log.Fatal("output directory is required (-o)")
 	}
 
-	// Read URLs from stdin if enabled
-	if opts.Stdin {
-		stdinURLs, err := readURLsFromStdin()
-		if err != nil {
-			log.Fatalf("Error reading URLs from stdin: %v", err)
-		}
+	var allInputs []string
 
-		opts.Input = append(opts.Input, stdinURLs...)
+	// Collect all inputs
+	allInputs = append(allInputs, opts.URLs...)
 
-		if !opts.Silent && len(stdinURLs) > 0 {
-			log.Printf("[+] Loaded %d URLs from stdin\n", len(stdinURLs))
-		}
+	// Add list file if provided
+	if opts.List != "" {
+		allInputs = append(allInputs, opts.List)
 	}
 
-	if len(opts.Input) == 0 {
-		log.Fatal("at least one -input or -stdin is required")
+	if len(allInputs) == 0 {
+		log.Fatal("at least one input is required (-u or -l)")
 	}
 
 	// Process all input sources
-	mapURLs, jsURLs, err := processInput(opts.Input, opts.Silent)
+	mapURLs, jsURLs, err := processInput(allInputs, opts.Silent)
 	if err != nil {
 		log.Fatalf("Error processing input: %v", err)
 	}
