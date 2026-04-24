@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/edsrzf/mmap-go"
 	"github.com/projectdiscovery/goflags"
 	"github.com/projectdiscovery/retryablehttp-go"
 )
@@ -147,19 +148,51 @@ func parseHeaders(headers []string) map[string]string {
 	return headerMap
 }
 
+// minFileSizeForMmap is the minimum file size (in bytes) for using memory mapping.
+const minFileSizeForMmap = 1024 * 1024 // 1MB
+
+// readFileSmart reads a file using memory mapping for large files and regular read for small files.
+// It returns the file content, an error, and an unmap function (no-op for regular read).
+func readFileSmart(path string) ([]byte, error, func()) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err, nil
+	}
+
+	// Use memory mapping for large files
+	if info.Size() >= minFileSizeForMmap {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err, nil
+		}
+		data, err := mmap.Map(f, mmap.RDONLY, 0)
+		f.Close() // The mmap holds the file descriptor open, so we can close the file
+		if err != nil {
+			return nil, err, nil
+		}
+		return data, nil, func() { data.Unmap() }
+	}
+
+	// Regular read for small files
+	data, err := os.ReadFile(path)
+	return data, err, func() {}
+}
+
 // getSourceMap retrieves a sourcemap from a URL or a local file and returns
 // its sourceMap.
 func getSourceMap(source string, client *retryablehttp.Client, headers map[string]string) (m sourceMap, err error) {
 	var body []byte
+	var unmap func()
 
 	log.Printf("[+] Retrieving Sourcemap from %.1024s...\n", source)
 
 	// Try local file first
 	if _, statErr := os.Stat(source); statErr == nil {
-		body, err = os.ReadFile(source)
+		body, err, unmap = readFileSmart(source)
 		if err != nil {
 			return m, err
 		}
+		defer unmap()
 	} else {
 		// Not a local file, try parsing as URL
 		u, err := url.ParseRequestURI(source)
