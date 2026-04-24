@@ -674,6 +674,15 @@ func main() {
 		allInputs = append(allInputs, opts.List)
 	}
 
+	// Read from stdin if requested
+	if opts.Stdin {
+		stdinURLs, err := readURLsFromStdin()
+		if err != nil {
+			log.Fatalf("Error reading from stdin: %v", err)
+		}
+		allInputs = append(allInputs, stdinURLs...)
+	}
+
 	if len(allInputs) == 0 {
 		log.Fatal("at least one input is required (-u or -l)")
 	}
