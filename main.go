@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -46,8 +45,9 @@ type httpClientConfig struct {
 
 // fileWriteJob represents a file write task
 type fileWriteJob struct {
-	path string
-	data string
+	path     string
+	data     string
+	priority int // priority: higher = more important (source files have higher priority)
 }
 
 // fileWriteResult represents the result of a file write operation
@@ -365,7 +365,65 @@ func fileWriter(jobs <-chan fileWriteJob, results chan<- fileWriteResult) {
 	}
 }
 
-// processSourceMap extracts and writes source files from a sourcemap
+// calculateFilePriority determines the priority of a source file
+// Higher priority = more likely to be the original source code
+func calculateFilePriority(sourcePath string, content string) int {
+	priority := 0
+
+	// Remove webpack prefix for analysis
+	cleanPath := strings.TrimPrefix(sourcePath, "webpack://")
+	parts := strings.Split(cleanPath, "/")
+	if len(parts) > 0 {
+		cleanPath = strings.Join(parts[1:], "/")
+	}
+
+	// Check if it has query parameters (like .vue?5d74)
+	hasQuery := strings.Contains(cleanPath, "?")
+
+	// Priority rules (higher = better):
+	// 1. Files WITHOUT query params are usually original source
+	if !hasQuery {
+		priority += 1000
+	}
+
+	// 2. Check content characteristics
+	contentLen := len(content)
+
+	// Original source files are usually longer and more readable
+	if contentLen > 1000 {
+		priority += 100
+	}
+
+	// 3. Check for source code patterns (vs compiled/minified code)
+	if strings.Contains(content, "async ") || strings.Contains(content, "await ") {
+		priority += 50
+	}
+
+	if strings.Contains(content, "export default") {
+		priority += 30
+	}
+
+	// Check for Vue/React component patterns
+	if strings.Contains(content, "mounted()") ||
+		strings.Contains(content, "created()") ||
+		strings.Contains(content, "methods:") {
+		priority += 40
+	}
+
+	// 4. Penalize render functions and compiled code
+	if strings.Contains(content, "var render = function") ||
+		strings.Contains(content, "staticRenderFns") {
+		priority -= 500
+	}
+
+	if strings.Contains(content, "_vm._self._c") {
+		priority -= 300
+	}
+
+	return priority
+}
+
+// processSourceMap extracts and writes source files from a sourcemap with smart priority handling
 func processSourceMap(sm sourceMap, outdir string, concurrency int, verbose bool) (int, error) {
 	log.Printf("[+] Retrieved Sourcemap with version %d, containing %d entries.\n", sm.Version, len(sm.Sources))
 
@@ -401,39 +459,74 @@ func processSourceMap(sm sourceMap, outdir string, concurrency int, verbose bool
 		}
 	}
 
-	// Create channels for worker pool
-	jobs := make(chan fileWriteJob, maxEntries)
-	results := make(chan fileWriteResult, maxEntries)
+	// Phase 1: Analyze and group files by their final output path
+	type fileCandidate struct {
+		sourcePath string
+		content    string
+		priority   int
+		index      int
+	}
+
+	fileGroups := make(map[string][]fileCandidate) // final path -> list of candidates
+
+	for i := 0; i < maxEntries; i++ {
+		sourcePath := normalizeWebpackPath(sm.Sources[i])
+		sourcePath = sanitizePath(sourcePath)
+		sourcePath = strings.TrimPrefix(sourcePath, "/")
+		sourcePath = filepath.Clean(sourcePath)
+
+		if runtime.GOOS == "windows" {
+			sourcePath = cleanWindows(sourcePath)
+		}
+
+		// Calculate the final output path
+		finalPath := filepath.Join(outdir, sourcePath)
+
+		// Calculate priority for this file
+		priority := calculateFilePriority(sm.Sources[i], sm.SourcesContent[i])
+
+		fileGroups[finalPath] = append(fileGroups[finalPath], fileCandidate{
+			sourcePath: sourcePath,
+			content:    sm.SourcesContent[i],
+			priority:   priority,
+			index:      i,
+		})
+	}
+
+	// Phase 2: Select the best candidate for each output path
+	jobs := make(chan fileWriteJob, len(fileGroups))
+	results := make(chan fileWriteResult, len(fileGroups))
 
 	// Start workers
 	for w := 0; w < concurrency; w++ {
 		go fileWriter(jobs, results)
 	}
 
-	// Send jobs
+	// Send jobs - only the highest priority file for each path
 	go func() {
-		for i := 0; i < maxEntries; i++ {
-			sourcePath := normalizeWebpackPath(sm.Sources[i])
-
-			// Sanitize path (remove/replace invalid characters like | : ? * etc)
-			sourcePath = sanitizePath(sourcePath)
-
-			// Remove leading slashes and clean path
-			sourcePath = strings.TrimPrefix(sourcePath, "/")
-			sourcePath = filepath.Clean(sourcePath)
-
-			// If on windows, additional cleaning
-			if runtime.GOOS == "windows" {
-				sourcePath = cleanWindows(sourcePath)
+		for finalPath, candidates := range fileGroups {
+			// Find the candidate with highest priority
+			bestCandidate := candidates[0]
+			for _, candidate := range candidates[1:] {
+				if candidate.priority > bestCandidate.priority {
+					bestCandidate = candidate
+				}
 			}
 
-			// Join with output directory
-			scriptPath := filepath.Join(outdir, sourcePath)
-			scriptData := sm.SourcesContent[i]
+			if verbose && len(candidates) > 1 {
+				log.Printf("[*] Multiple sources for %s: selected source #%d (priority: %d) over %d others",
+					finalPath, bestCandidate.index, bestCandidate.priority, len(candidates)-1)
+				for _, c := range candidates {
+					if c.index != bestCandidate.index {
+						log.Printf("    - Skipped source #%d (priority: %d)", c.index, c.priority)
+					}
+				}
+			}
 
 			jobs <- fileWriteJob{
-				path: scriptPath,
-				data: scriptData,
+				path:     finalPath,
+				data:     bestCandidate.content,
+				priority: bestCandidate.priority,
 			}
 		}
 		close(jobs)
@@ -441,7 +534,7 @@ func processSourceMap(sm sourceMap, outdir string, concurrency int, verbose bool
 
 	// Collect results
 	processedCount := 0
-	for i := 0; i < maxEntries; i++ {
+	for i := 0; i < len(fileGroups); i++ {
 		result := <-results
 		if result.success {
 			processedCount++
@@ -450,93 +543,108 @@ func processSourceMap(sm sourceMap, outdir string, concurrency int, verbose bool
 		}
 	}
 
-	log.Printf("[+] Successfully processed %d out of %d source entries.", processedCount, len(sm.Sources))
+	log.Printf("[+] Successfully wrote %d unique files (from %d total sources)\n", processedCount, maxEntries)
 	return processedCount, nil
 }
 
-// cleanWindows replaces the illegal characters from a path with `-`.
-func cleanWindows(p string) string {
-	m1 := regexp.MustCompile(`[?%*|:"<>]`)
-	return m1.ReplaceAllString(p, "")
+func sanitizePath(path string) string {
+	// Handle common webpack prefixes
+	if strings.HasPrefix(path, "webpack://") {
+		parts := strings.Split(path, "/")
+		if len(parts) > 2 {
+			path = strings.Join(parts[2:], "/")
+		}
+	}
+
+	// Replace invalid filename characters (platform-specific)
+	invalidChars := []string{"|", "*", ":", "<", ">", "\""}
+
+	for _, char := range invalidChars {
+		path = strings.ReplaceAll(path, char, "_")
+	}
+
+	return path
 }
 
-// sanitizePath removes or replaces invalid characters from path
-func sanitizePath(p string) string {
-	// Replace pipe characters and other problematic chars
-	p = strings.ReplaceAll(p, "|", "_")
-	p = strings.ReplaceAll(p, ":", "_")
-	p = strings.ReplaceAll(p, "?", "_")
-	p = strings.ReplaceAll(p, "*", "_")
-	p = strings.ReplaceAll(p, "\"", "_")
-	p = strings.ReplaceAll(p, "<", "_")
-	p = strings.ReplaceAll(p, ">", "_")
-	return p
+func cleanWindows(path string) string {
+	// Windows has additional reserved names
+	reserved := []string{"CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
+
+	parts := strings.Split(path, string(filepath.Separator))
+	for i, part := range parts {
+		upperPart := strings.ToUpper(part)
+		for _, res := range reserved {
+			if upperPart == res {
+				parts[i] = part + "_"
+				break
+			}
+		}
+	}
+
+	return strings.Join(parts, string(filepath.Separator))
 }
 
-// isListFile checks if a file looks like a list file (text file with URLs)
+// isListFile checks if a path is likely a list file based on content or extension
 func isListFile(path string) bool {
-	// Check if file exists
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		return false
-	}
-
-	// If extension suggests it's a list file
+	// Check file extension first
 	ext := strings.ToLower(filepath.Ext(path))
-	if ext == ".txt" || ext == ".lst" {
+	if ext == ".txt" || ext == ".list" {
 		return true
 	}
 
-	// If no extension and filename suggests list
-	if ext == "" && (strings.Contains(path, "list") || strings.Contains(path, "urls")) {
-		return true
-	}
+	// For files without these extensions, check content
+	// (only if the file exists locally)
+	if _, err := os.Stat(path); err == nil {
+		// Read first few lines to check format
+		f, err := os.Open(path)
+		if err != nil {
+			return false
+		}
+		defer f.Close()
 
-	// Otherwise, try to detect by content - read first few lines
-	file, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer file.Close()
+		scanner := bufio.NewScanner(f)
+		lineCount := 0
+		urlCount := 0
 
-	scanner := bufio.NewScanner(file)
-	lineCount := 0
-	urlCount := 0
+		// Check first 5 lines
+		for scanner.Scan() && lineCount < 5 {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
 
-	for scanner.Scan() && lineCount < 10 {
-		line := strings.TrimSpace(scanner.Text())
-		lineCount++
-
-		// Skip empty lines and comments
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+			lineCount++
+			// Check if line looks like a URL or path
+			if strings.HasPrefix(line, "http://") ||
+				strings.HasPrefix(line, "https://") ||
+				strings.HasPrefix(line, "/") ||
+				strings.HasSuffix(line, ".map") ||
+				strings.HasSuffix(line, ".js") {
+				urlCount++
+			}
 		}
 
-		// Check if line looks like URL or file path
-		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") ||
-			strings.HasSuffix(line, ".map") || strings.HasSuffix(line, ".map.json") ||
-			strings.HasSuffix(line, ".js") {
-			urlCount++
-		}
+		// If most lines look like URLs/paths, treat as list file
+		return urlCount > 0 && float64(urlCount)/float64(lineCount) > 0.5
 	}
 
-	// If most lines look like URLs, treat as list file
-	return urlCount >= 2 || (lineCount > 0 && urlCount == lineCount)
+	return false
 }
 
-// readURLsFromFile reads URLs from file and categorizes them
-func readURLsFromFile(filename string) (mapURLs []string, jsURLs []string, err error) {
-	data, err, unmap := readFileSmart(filename)
+// readURLsFromFile reads URLs from a file and categorizes them
+func readURLsFromFile(path string) (mapURLs []string, jsURLs []string, err error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer unmap()
+	defer f.Close()
 
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	lineNum := 0
+	scanner := bufio.NewScanner(f)
+	var urls []string
 
 	for scanner.Scan() {
-		lineNum++
 		line := strings.TrimSpace(scanner.Text())
 
 		// Skip empty lines and comments
@@ -544,41 +652,32 @@ func readURLsFromFile(filename string) (mapURLs []string, jsURLs []string, err e
 			continue
 		}
 
-		// Auto-detect based on extension or pattern
-		if strings.HasSuffix(line, ".map") || strings.HasSuffix(line, ".map.json") || strings.Contains(line, ".map?") {
-			// Sourcemap URL
-			mapURLs = append(mapURLs, line)
-		} else if strings.HasSuffix(line, ".js") || strings.Contains(line, ".js?") {
-			// JavaScript URL
-			jsURLs = append(jsURLs, line)
-		} else {
-			// Unknown, try to detect from URL pattern
-			if strings.Contains(line, "sourceMappingURL") || strings.Contains(line, "sourceMap") {
-				mapURLs = append(mapURLs, line)
-			} else {
-				// Default to JS
-				jsURLs = append(jsURLs, line)
-			}
-		}
+		urls = append(urls, line)
 	}
 
 	if err := scanner.Err(); err != nil {
 		return nil, nil, err
 	}
 
+	mapURLs, jsURLs = categorizeURLs(urls)
 	return mapURLs, jsURLs, nil
 }
 
-// categorizeURLs splits URLs into sourcemap and JavaScript URLs
+// categorizeURLs splits URLs into sourcemap URLs and JavaScript URLs
 func categorizeURLs(urls []string) (mapURLs []string, jsURLs []string) {
 	for _, u := range urls {
-		// Auto-detect based on extension or pattern
-		if strings.HasSuffix(u, ".map") || strings.HasSuffix(u, ".map.json") || strings.Contains(u, ".map?") {
+		// Clean up URL
+		u = strings.TrimSpace(u)
+
+		// Check if it's explicitly a sourcemap URL or JS file
+		if strings.HasSuffix(u, ".map") ||
+			strings.Contains(u, ".map?") {
 			mapURLs = append(mapURLs, u)
-		} else if strings.HasSuffix(u, ".js") || strings.Contains(u, ".js?") {
+		} else if strings.HasSuffix(u, ".js") ||
+			strings.Contains(u, ".js?") {
 			jsURLs = append(jsURLs, u)
 		} else {
-			// Unknown, try to detect from URL pattern
+			// For ambiguous cases, check content
 			if strings.Contains(u, "sourceMappingURL") || strings.Contains(u, "sourceMap") {
 				mapURLs = append(mapURLs, u)
 			} else {
@@ -663,7 +762,7 @@ func main() {
 	opts := &options{}
 
 	flagSet := goflags.NewFlagSet()
-	flagSet.SetDescription("Extract source code from JavaScript sourcemaps")
+	flagSet.SetDescription("Extract source code from JavaScript sourcemaps (OPTIMIZED VERSION)")
 
 	flagSet.CreateGroup("input", "Input",
 		flagSet.StringSliceVarP(&opts.URLs, "url", "u", nil, "URL/path to .map/.js file or list file (comma-separated)", goflags.CommaSeparatedStringSliceOptions),
