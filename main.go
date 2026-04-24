@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -152,48 +153,81 @@ func parseHeaders(headers []string) map[string]string {
 // minFileSizeForMmap is the minimum file size (in bytes) for using memory mapping.
 const minFileSizeForMmap = 1024 * 1024 // 1MB
 
-// readFileSmart reads a file using memory mapping for large files and regular read for small files.
-// It returns the file content, an error, and an unmap function (no-op for regular read).
-func readFileSmart(path string) ([]byte, error, func()) {
+// FileReader manages file reading with automatic mmap optimization
+type FileReader struct {
+	path     string
+	data     []byte
+	mmapped  bool
+	mmapData mmap.MMap
+}
+
+// NewFileReader creates a new file reader with automatic mmap for large files
+func NewFileReader(path string) (*FileReader, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, err, nil
+		return nil, err
 	}
+
+	fr := &FileReader{path: path}
 
 	// Use memory mapping for large files
 	if info.Size() >= minFileSizeForMmap {
 		f, err := os.Open(path)
 		if err != nil {
-			return nil, err, nil
+			return nil, err
 		}
-		data, err := mmap.Map(f, mmap.RDONLY, 0)
-		f.Close() // The mmap holds the file descriptor open, so we can close the file
+		defer f.Close()
+
+		mmapData, err := mmap.Map(f, mmap.RDONLY, 0)
 		if err != nil {
-			return nil, err, nil
+			return nil, err
 		}
-		return data, nil, func() { data.Unmap() }
+
+		fr.data = mmapData
+		fr.mmapData = mmapData
+		fr.mmapped = true
+	} else {
+		// Regular read for small files
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		fr.data = data
+		fr.mmapped = false
 	}
 
-	// Regular read for small files
-	data, err := os.ReadFile(path)
-	return data, err, func() {}
+	return fr, nil
+}
+
+// Data returns the file content
+func (fr *FileReader) Data() []byte {
+	return fr.data
+}
+
+// Close releases resources (unmaps if needed)
+func (fr *FileReader) Close() error {
+	if fr.mmapped && fr.mmapData != nil {
+		return fr.mmapData.Unmap()
+	}
+	return nil
 }
 
 // getSourceMap retrieves a sourcemap from a URL or a local file and returns
 // its sourceMap.
 func getSourceMap(source string, client *retryablehttp.Client, headers map[string]string) (m sourceMap, err error) {
 	var body []byte
-	var unmap func()
 
 	log.Printf("[+] Retrieving Sourcemap from %.1024s...\n", source)
 
 	// Try local file first
 	if _, statErr := os.Stat(source); statErr == nil {
-		body, err, unmap = readFileSmart(source)
+		reader, err := NewFileReader(source)
 		if err != nil {
 			return m, err
 		}
-		defer unmap()
+		defer reader.Close()
+
+		body = reader.Data()
 	} else {
 		// Not a local file, try parsing as URL
 		u, err := url.ParseRequestURI(source)
@@ -353,16 +387,73 @@ func writeFile(p string, content string) error {
 	return os.WriteFile(p, []byte(content), 0600)
 }
 
-// fileWriter is a worker that processes file write jobs
-func fileWriter(jobs <-chan fileWriteJob, results chan<- fileWriteResult) {
-	for job := range jobs {
+// WorkerPool manages concurrent file write operations
+type WorkerPool struct {
+	workers    int
+	jobs       chan fileWriteJob
+	results    chan fileWriteResult
+	workersWG  sync.WaitGroup
+	activeJobs int
+	jobsMutex  sync.Mutex
+}
+
+// NewWorkerPool creates a new worker pool for file operations
+func NewWorkerPool(workers int, bufferSize int) *WorkerPool {
+	wp := &WorkerPool{
+		workers: workers,
+		jobs:    make(chan fileWriteJob, bufferSize),
+		results: make(chan fileWriteResult, bufferSize),
+	}
+
+	// Start workers
+	for i := 0; i < workers; i++ {
+		wp.workersWG.Add(1)
+		go wp.worker()
+	}
+
+	return wp
+}
+
+// worker processes file write jobs
+func (wp *WorkerPool) worker() {
+	defer wp.workersWG.Done()
+
+	for job := range wp.jobs {
 		err := writeFile(job.path, job.data)
-		results <- fileWriteResult{
+		wp.results <- fileWriteResult{
 			path:    job.path,
 			success: err == nil,
 			err:     err,
 		}
 	}
+}
+
+// Submit submits a new job to the worker pool
+func (wp *WorkerPool) Submit(job fileWriteJob) {
+	wp.jobsMutex.Lock()
+	wp.activeJobs++
+	wp.jobsMutex.Unlock()
+
+	wp.jobs <- job
+}
+
+// Close closes the worker pool and waits for all workers to finish
+func (wp *WorkerPool) Close() {
+	close(wp.jobs)
+	wp.workersWG.Wait()
+	close(wp.results)
+}
+
+// Results returns the results channel
+func (wp *WorkerPool) Results() <-chan fileWriteResult {
+	return wp.results
+}
+
+// ActiveJobs returns the number of submitted jobs
+func (wp *WorkerPool) ActiveJobs() int {
+	wp.jobsMutex.Lock()
+	defer wp.jobsMutex.Unlock()
+	return wp.activeJobs
 }
 
 // calculateFilePriority determines the priority of a source file
@@ -493,49 +584,44 @@ func processSourceMap(sm sourceMap, outdir string, concurrency int, verbose bool
 		})
 	}
 
-	// Phase 2: Select the best candidate for each output path
-	jobs := make(chan fileWriteJob, len(fileGroups))
-	results := make(chan fileWriteResult, len(fileGroups))
+	// Phase 2: Create worker pool and submit jobs
+	pool := NewWorkerPool(concurrency, len(fileGroups))
 
-	// Start workers
-	for w := 0; w < concurrency; w++ {
-		go fileWriter(jobs, results)
-	}
-
-	// Send jobs - only the highest priority file for each path
-	go func() {
-		for finalPath, candidates := range fileGroups {
-			// Find the candidate with highest priority
-			bestCandidate := candidates[0]
-			for _, candidate := range candidates[1:] {
-				if candidate.priority > bestCandidate.priority {
-					bestCandidate = candidate
-				}
-			}
-
-			if verbose && len(candidates) > 1 {
-				log.Printf("[*] Multiple sources for %s: selected source #%d (priority: %d) over %d others",
-					finalPath, bestCandidate.index, bestCandidate.priority, len(candidates)-1)
-				for _, c := range candidates {
-					if c.index != bestCandidate.index {
-						log.Printf("    - Skipped source #%d (priority: %d)", c.index, c.priority)
-					}
-				}
-			}
-
-			jobs <- fileWriteJob{
-				path:     finalPath,
-				data:     bestCandidate.content,
-				priority: bestCandidate.priority,
+	// Submit jobs - only the highest priority file for each path
+	for finalPath, candidates := range fileGroups {
+		// Find the candidate with highest priority
+		bestCandidate := candidates[0]
+		for _, candidate := range candidates[1:] {
+			if candidate.priority > bestCandidate.priority {
+				bestCandidate = candidate
 			}
 		}
-		close(jobs)
-	}()
 
-	// Collect results
+		if verbose && len(candidates) > 1 {
+			log.Printf("[*] Multiple sources for %s: selected source #%d (priority: %d) over %d others",
+				finalPath, bestCandidate.index, bestCandidate.priority, len(candidates)-1)
+			for _, c := range candidates {
+				if c.index != bestCandidate.index {
+					log.Printf("    - Skipped source #%d (priority: %d)", c.index, c.priority)
+				}
+			}
+		}
+
+		pool.Submit(fileWriteJob{
+			path:     finalPath,
+			data:     bestCandidate.content,
+			priority: bestCandidate.priority,
+		})
+	}
+
+	// Phase 3: Collect results
+	go pool.Close() // Close pool in background after all jobs submitted
+
 	processedCount := 0
-	for i := 0; i < len(fileGroups); i++ {
-		result := <-results
+	totalJobs := pool.ActiveJobs()
+
+	for i := 0; i < totalJobs; i++ {
+		result := <-pool.Results()
 		if result.success {
 			processedCount++
 		} else {
