@@ -25,15 +25,16 @@ import (
 	"github.com/projectdiscovery/retryablehttp-go"
 )
 
-// sourceMap represents a sourceMap. We only really care about the sources and
-// sourcesContent arrays.
+// ============================================================================
+// CORE DATA STRUCTURES
+// ============================================================================
+
 type sourceMap struct {
 	Version        int      `json:"version"`
 	Sources        []string `json:"sources"`
 	SourcesContent []string `json:"sourcesContent"`
 }
 
-// httpClientConfig holds HTTP client configuration
 type httpClientConfig struct {
 	timeout      time.Duration
 	retries      int
@@ -44,26 +45,23 @@ type httpClientConfig struct {
 	maxRedirs    int
 }
 
-// fileWriteJob represents a file write task
 type fileWriteJob struct {
 	path     string
 	data     string
-	priority int // priority: higher = more important (source files have higher priority)
+	priority int
 }
 
-// fileWriteResult represents the result of a file write operation
 type fileWriteResult struct {
 	path    string
 	success bool
 	err     error
 }
 
-// options represents command line options
 type options struct {
 	Output      string
-	URLs        goflags.StringSlice // URLs, paths, or list files - auto-detect all
-	List        string              // File containing URLs (for compatibility)
-	Stdin       bool                // Read URLs from stdin for pipeline
+	URLs        goflags.StringSlice
+	List        string
+	Stdin       bool
 	Proxy       string
 	Timeout     int
 	Retries     int
@@ -75,102 +73,26 @@ type options struct {
 	Verbose     bool
 }
 
-// newHTTPClient creates a configured retryable HTTP client
-func newHTTPClient(cfg httpClientConfig) *retryablehttp.Client {
-	// Create transport
-	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: cfg.insecure,
-		},
-		DisableKeepAlives: false,
-	}
+// ============================================================================
+// FILE READER WITH MMAP
+// ============================================================================
 
-	// Add proxy if configured
-	if cfg.proxy != nil {
-		transport.Proxy = http.ProxyURL(cfg.proxy)
-	}
-
-	// Create base HTTP client
-	httpClient := &http.Client{
-		Timeout:   cfg.timeout,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if !cfg.followRedirs {
-				return http.ErrUseLastResponse
-			}
-			if len(via) >= cfg.maxRedirs {
-				return errors.New("stopped after max redirects")
-			}
-			return nil
-		},
-	}
-
-	// Create Options struct for retryablehttp
-	options := retryablehttp.Options{
-		HttpClient:   httpClient,
-		RetryWaitMin: 1 * time.Second,
-		RetryWaitMax: 5 * time.Second,
-		Timeout:      cfg.timeout,
-		RetryMax:     cfg.retries,
-	}
-
-	// Create retryable client
-	client := retryablehttp.NewClient(options)
-
-	return client
-}
-
-// parseHeaders converts headerList to map
-func parseHeaders(headers []string) map[string]string {
-	headerMap := make(map[string]string)
-
-	if len(headers) == 0 {
-		return headerMap
-	}
-
-	headerString := strings.Join(headers, "\r\n") + "\r\n\r\n"
-	r := bufio.NewReader(strings.NewReader(headerString))
-	tpReader := textproto.NewReader(r)
-	mimeHeader, err := tpReader.ReadMIMEHeader()
-
-	if err != nil {
-		log.Printf("[!] Error parsing headers: %v", err)
-		return headerMap
-	}
-
-	for key, values := range mimeHeader {
-		if len(values) > 0 {
-			headerMap[key] = values[0]
-		}
-	}
-
-	return headerMap
-}
-
-// minFileSizeForMmap is the minimum file size (in bytes) for using memory mapping.
 const minFileSizeForMmap = 1024 * 1024 // 1MB
 
-// FileReader manages file reading with automatic mmap optimization
 type FileReader struct {
-	path     string
 	data     []byte
-	mmapped  bool
 	mmapData mmap.MMap
+	mmapped  bool
 }
 
-// NewFileReader creates a new file reader with automatic mmap for large files
 func NewFileReader(path string) (*FileReader, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
 
-	fr := &FileReader{path: path}
+	fr := &FileReader{}
 
-	// Use memory mapping for large files
 	if info.Size() >= minFileSizeForMmap {
 		f, err := os.Open(path)
 		if err != nil {
@@ -187,24 +109,20 @@ func NewFileReader(path string) (*FileReader, error) {
 		fr.mmapData = mmapData
 		fr.mmapped = true
 	} else {
-		// Regular read for small files
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, err
 		}
 		fr.data = data
-		fr.mmapped = false
 	}
 
 	return fr, nil
 }
 
-// Data returns the file content
 func (fr *FileReader) Data() []byte {
 	return fr.data
 }
 
-// Close releases resources (unmaps if needed)
 func (fr *FileReader) Close() error {
 	if fr.mmapped && fr.mmapData != nil {
 		return fr.mmapData.Unmap()
@@ -212,200 +130,26 @@ func (fr *FileReader) Close() error {
 	return nil
 }
 
-// getSourceMap retrieves a sourcemap from a URL or a local file and returns
-// its sourceMap.
-func getSourceMap(source string, client *retryablehttp.Client, headers map[string]string) (m sourceMap, err error) {
-	var body []byte
+// ============================================================================
+// WORKER POOL
+// ============================================================================
 
-	log.Printf("[+] Retrieving Sourcemap from %.1024s...\n", source)
-
-	// Try local file first
-	if _, statErr := os.Stat(source); statErr == nil {
-		reader, err := NewFileReader(source)
-		if err != nil {
-			return m, err
-		}
-		defer reader.Close()
-
-		body = reader.Data()
-	} else {
-		// Not a local file, try parsing as URL
-		u, err := url.ParseRequestURI(source)
-		if err != nil {
-			return m, err
-		}
-
-		if u.Scheme == "http" || u.Scheme == "https" {
-			// If it's a URL, get it.
-			req, err := retryablehttp.NewRequest("GET", u.String(), nil)
-			if err != nil {
-				return m, err
-			}
-
-			// Set headers
-			for key, value := range headers {
-				req.Header.Set(key, value)
-			}
-
-			res, err := client.Do(req)
-			if err != nil {
-				return m, err
-			}
-			defer res.Body.Close()
-
-			body, err = io.ReadAll(res.Body)
-			if err != nil {
-				return m, err
-			}
-
-			if res.StatusCode != 200 && len(body) > 0 {
-				log.Printf("[!] WARNING - non-200 status code: %d - Confirm this URL contains valid source map manually!", res.StatusCode)
-				log.Printf("[!] WARNING - sourceMap URL request return != 200 - however, body length > 0 so continuing... ")
-			}
-
-		} else if u.Scheme == "data" {
-			urlchunks := strings.Split(u.Opaque, ",")
-			if len(urlchunks) < 2 {
-				return m, errors.New("could not parse data URI - expected at least 2 chunks")
-			}
-
-			data, err := base64.StdEncoding.DecodeString(urlchunks[1])
-			if err != nil {
-				return m, err
-			}
-
-			body = []byte(data)
-		} else {
-			return m, errors.New("unsupported URL scheme: " + u.Scheme)
-		}
-	}
-
-	// Unmarshal the body into the struct.
-	log.Printf("[+] Read %d bytes, parsing JSON.\n", len(body))
-	err = sonic.Unmarshal(body, &m)
-
-	if err != nil {
-		log.Printf("[!] Error parsing JSON - confirm %s is a valid JS sourcemap", source)
-		return m, err
-	}
-
-	return m, nil
-}
-
-// getSourceMapFromJS queries a JavaScript URL, parses its headers and content and looks for sourcemaps
-// follows the rules outlined in https://tc39.es/source-map-spec/#linking-generated-code
-func getSourceMapFromJS(jsurl string, client *retryablehttp.Client, headers map[string]string) (m sourceMap, err error) {
-	log.Printf("[+] Retrieving JavaScript from URL: %s\n", jsurl)
-
-	// perform the request
-	u, err := url.ParseRequestURI(jsurl)
-	if err != nil {
-		return m, err
-	}
-
-	req, err := retryablehttp.NewRequest("GET", u.String(), nil)
-	if err != nil {
-		return m, err
-	}
-
-	// Set headers
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-
-	res, err := client.Do(req)
-	if err != nil {
-		return m, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != 200 {
-		return m, errors.New("non-200 status code: " + res.Status)
-	}
-
-	var sourceMap string
-
-	// check for SourceMap and X-SourceMap (deprecated) headers
-	if sourceMap = res.Header.Get("SourceMap"); sourceMap == "" {
-		sourceMap = res.Header.Get("X-SourceMap")
-	}
-
-	if sourceMap != "" {
-		log.Printf("[.] Found SourceMap URI in response headers: %.1024s...", sourceMap)
-	} else {
-		// parse the javascript
-		body, err := io.ReadAll(res.Body)
-		if err != nil {
-			return m, err
-		}
-
-		// JS file can have multiple source maps in it, but only the last line is valid https://sourcemaps.info/spec.html#h.lmz475t4mvbx
-		re := regexp.MustCompile(`\/\/[@#] sourceMappingURL=(.*)`)
-		match := re.FindAllSubmatch(body, -1)
-
-		if len(match) != 0 {
-			// only the sourcemap at the end of the file should be valid
-			sourceMap = string(match[len(match)-1][1])
-			log.Printf("[.] Found SourceMap in JavaScript body: %.1024s...", sourceMap)
-		}
-	}
-
-	// this introduces a forced request bug if the JS file we're parsing is
-	// malicious and forces us to make a request out to something dodgy - take care
-	if sourceMap != "" {
-		var sourceMapURL *url.URL
-		// handle absolute/relative rules
-		sourceMapURL, err = url.ParseRequestURI(sourceMap)
-		if err != nil {
-			// relative url...
-			sourceMapURL, err = u.Parse(sourceMap)
-			if err != nil {
-				return m, err
-			}
-		}
-
-		return getSourceMap(sourceMapURL.String(), client, headers)
-	}
-
-	return m, errors.New("no sourcemap URL found")
-}
-
-// writeFile writes content to file at path p.
-func writeFile(p string, content string) error {
-	p = filepath.Clean(p)
-
-	if _, err := os.Stat(filepath.Dir(p)); os.IsNotExist(err) {
-		// Using MkdirAll here is tricky, because even if we fail, we might have
-		// created some of the parent directories.
-		err = os.MkdirAll(filepath.Dir(p), 0700)
-		if err != nil {
-			return err
-		}
-	}
-
-	log.Printf("[+] Writing %d bytes to %s.\n", len(content), p)
-	return os.WriteFile(p, []byte(content), 0600)
-}
-
-// WorkerPool manages concurrent file write operations
 type WorkerPool struct {
-	workers    int
-	jobs       chan fileWriteJob
-	results    chan fileWriteResult
-	workersWG  sync.WaitGroup
-	activeJobs int
-	jobsMutex  sync.Mutex
+	workers   int
+	jobs      chan fileWriteJob
+	results   chan fileWriteResult
+	workersWG sync.WaitGroup
+	jobsCount int
+	mutex     sync.Mutex
 }
 
-// NewWorkerPool creates a new worker pool for file operations
-func NewWorkerPool(workers int, bufferSize int) *WorkerPool {
+func NewWorkerPool(workers, bufferSize int) *WorkerPool {
 	wp := &WorkerPool{
 		workers: workers,
 		jobs:    make(chan fileWriteJob, bufferSize),
 		results: make(chan fileWriteResult, bufferSize),
 	}
 
-	// Start workers
 	for i := 0; i < workers; i++ {
 		wp.workersWG.Add(1)
 		go wp.worker()
@@ -414,10 +158,8 @@ func NewWorkerPool(workers int, bufferSize int) *WorkerPool {
 	return wp
 }
 
-// worker processes file write jobs
 func (wp *WorkerPool) worker() {
 	defer wp.workersWG.Done()
-
 	for job := range wp.jobs {
 		err := writeFile(job.path, job.data)
 		wp.results <- fileWriteResult{
@@ -428,213 +170,339 @@ func (wp *WorkerPool) worker() {
 	}
 }
 
-// Submit submits a new job to the worker pool
 func (wp *WorkerPool) Submit(job fileWriteJob) {
-	wp.jobsMutex.Lock()
-	wp.activeJobs++
-	wp.jobsMutex.Unlock()
-
+	wp.mutex.Lock()
+	wp.jobsCount++
+	wp.mutex.Unlock()
 	wp.jobs <- job
 }
 
-// Close closes the worker pool and waits for all workers to finish
 func (wp *WorkerPool) Close() {
 	close(wp.jobs)
 	wp.workersWG.Wait()
 	close(wp.results)
 }
 
-// Results returns the results channel
 func (wp *WorkerPool) Results() <-chan fileWriteResult {
 	return wp.results
 }
 
-// ActiveJobs returns the number of submitted jobs
-func (wp *WorkerPool) ActiveJobs() int {
-	wp.jobsMutex.Lock()
-	defer wp.jobsMutex.Unlock()
-	return wp.activeJobs
+func (wp *WorkerPool) JobsCount() int {
+	wp.mutex.Lock()
+	defer wp.mutex.Unlock()
+	return wp.jobsCount
 }
 
-// calculateFilePriority determines the priority of a source file
-// Higher priority = more likely to be the original source code
-func calculateFilePriority(sourcePath string, content string) int {
+// ============================================================================
+// HTTP CLIENT
+// ============================================================================
+
+func newHTTPClient(cfg httpClientConfig) *retryablehttp.Client {
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: cfg.insecure},
+		DisableKeepAlives:   false,
+	}
+
+	if cfg.proxy != nil {
+		transport.Proxy = http.ProxyURL(cfg.proxy)
+	}
+
+	httpClient := &http.Client{
+		Timeout:   cfg.timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if !cfg.followRedirs {
+				return http.ErrUseLastResponse
+			}
+			if len(via) >= cfg.maxRedirs {
+				return errors.New("stopped after max redirects")
+			}
+			return nil
+		},
+	}
+
+	return retryablehttp.NewClient(retryablehttp.Options{
+		HttpClient:   httpClient,
+		RetryWaitMin: 1 * time.Second,
+		RetryWaitMax: 5 * time.Second,
+		Timeout:      cfg.timeout,
+		RetryMax:     cfg.retries,
+	})
+}
+
+// ============================================================================
+// CONTENT FETCHERS - Unified approach
+// ============================================================================
+
+type ContentFetcher interface {
+	Fetch() ([]byte, error)
+}
+
+// LocalFileFetcher reads from local filesystem
+type LocalFileFetcher struct {
+	path string
+}
+
+func (f *LocalFileFetcher) Fetch() ([]byte, error) {
+	reader, err := NewFileReader(f.path)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return reader.Data(), nil
+}
+
+// HTTPFetcher reads from HTTP/HTTPS
+type HTTPFetcher struct {
+	url     string
+	client  *retryablehttp.Client
+	headers map[string]string
+}
+
+func (f *HTTPFetcher) Fetch() ([]byte, error) {
+	req, err := retryablehttp.NewRequest("GET", f.url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, value := range f.headers {
+		req.Header.Set(key, value)
+	}
+
+	res, err := f.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if res.StatusCode != 200 && len(body) > 0 {
+		log.Printf("[!] WARNING - non-200 status code: %d", res.StatusCode)
+	}
+
+	return body, nil
+}
+
+// DataURIFetcher reads from data: URI
+type DataURIFetcher struct {
+	uri string
+}
+
+func (f *DataURIFetcher) Fetch() ([]byte, error) {
+	parts := strings.Split(strings.TrimPrefix(f.uri, "data:"), ",")
+	if len(parts) < 2 {
+		return nil, errors.New("invalid data URI format")
+	}
+	return base64.StdEncoding.DecodeString(parts[1])
+}
+
+// GetFetcher returns appropriate fetcher for the source
+func GetFetcher(source string, client *retryablehttp.Client, headers map[string]string) (ContentFetcher, error) {
+	// Check if it's a local file
+	if _, err := os.Stat(source); err == nil {
+		return &LocalFileFetcher{path: source}, nil
+	}
+
+	// Parse as URL
+	u, err := url.ParseRequestURI(source)
+	if err != nil {
+		return nil, err
+	}
+
+	switch u.Scheme {
+	case "http", "https":
+		return &HTTPFetcher{url: source, client: client, headers: headers}, nil
+	case "data":
+		return &DataURIFetcher{uri: source}, nil
+	default:
+		return nil, fmt.Errorf("unsupported URL scheme: %s", u.Scheme)
+	}
+}
+
+// ============================================================================
+// SOURCEMAP OPERATIONS
+// ============================================================================
+
+func fetchAndParseSourceMap(source string, client *retryablehttp.Client, headers map[string]string) (sourceMap, error) {
+	log.Printf("[+] Retrieving Sourcemap from %.1024s...\n", source)
+
+	fetcher, err := GetFetcher(source, client, headers)
+	if err != nil {
+		return sourceMap{}, err
+	}
+
+	body, err := fetcher.Fetch()
+	if err != nil {
+		return sourceMap{}, err
+	}
+
+	log.Printf("[+] Read %d bytes, parsing JSON.\n", len(body))
+
+	var sm sourceMap
+	if err := sonic.Unmarshal(body, &sm); err != nil {
+		log.Printf("[!] Error parsing JSON - confirm %s is a valid JS sourcemap", source)
+		return sourceMap{}, err
+	}
+
+	return sm, nil
+}
+
+func extractSourceMapURL(jsBody []byte, jsURL *url.URL) (string, error) {
+	// Find sourceMappingURL in JS
+	re := regexp.MustCompile(`\/\/[@#] sourceMappingURL=(.*)`)
+	matches := re.FindAllSubmatch(jsBody, -1)
+
+	if len(matches) == 0 {
+		return "", errors.New("no sourcemap URL found")
+	}
+
+	// Use last match (as per spec)
+	sourceMapRef := string(matches[len(matches)-1][1])
+	log.Printf("[.] Found SourceMap in JavaScript body: %.1024s...", sourceMapRef)
+
+	// Parse as absolute or relative URL
+	sourceMapURL, err := url.ParseRequestURI(sourceMapRef)
+	if err != nil {
+		// Relative URL
+		sourceMapURL, err = jsURL.Parse(sourceMapRef)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return sourceMapURL.String(), nil
+}
+
+func getSourceMapFromJS(jsurl string, client *retryablehttp.Client, headers map[string]string) (sourceMap, error) {
+	log.Printf("[+] Retrieving JavaScript from URL: %s\n", jsurl)
+
+	u, err := url.ParseRequestURI(jsurl)
+	if err != nil {
+		return sourceMap{}, err
+	}
+
+	fetcher := &HTTPFetcher{url: jsurl, client: client, headers: headers}
+	body, err := fetcher.Fetch()
+	if err != nil {
+		return sourceMap{}, err
+	}
+
+	// Try to get sourcemap URL from body
+	sourceMapURL, err := extractSourceMapURL(body, u)
+	if err != nil {
+		return sourceMap{}, err
+	}
+
+	return fetchAndParseSourceMap(sourceMapURL, client, headers)
+}
+
+// ============================================================================
+// FILE PRIORITY CALCULATOR
+// ============================================================================
+
+type PriorityRule struct {
+	name      string
+	checkFunc func(path, content string) bool
+	score     int
+}
+
+var priorityRules = []PriorityRule{
+	{"NoQueryParams", func(path, _ string) bool {
+		cleanPath := strings.TrimPrefix(path, "webpack://")
+		if idx := strings.Index(cleanPath, "/"); idx != -1 {
+			cleanPath = cleanPath[idx+1:]
+		}
+		return !strings.Contains(cleanPath, "?")
+	}, 1000},
+
+	{"LargeFile", func(_, content string) bool {
+		return len(content) > 1000
+	}, 100},
+
+	{"HasAsync", func(_, content string) bool {
+		return strings.Contains(content, "async ") || strings.Contains(content, "await ")
+	}, 50},
+
+	{"HasExportDefault", func(_, content string) bool {
+		return strings.Contains(content, "export default")
+	}, 30},
+
+	{"HasVueLifecycle", func(_, content string) bool {
+		return strings.Contains(content, "mounted()") ||
+			strings.Contains(content, "created()") ||
+			strings.Contains(content, "methods:")
+	}, 40},
+
+	{"IsRenderFunction", func(_, content string) bool {
+		return strings.Contains(content, "var render = function") ||
+			strings.Contains(content, "staticRenderFns")
+	}, -500},
+
+	{"IsVueCompiled", func(_, content string) bool {
+		return strings.Contains(content, "_vm._self._c")
+	}, -300},
+}
+
+func calculateFilePriority(sourcePath, content string) int {
 	priority := 0
-
-	// Remove webpack prefix for analysis
-	cleanPath := strings.TrimPrefix(sourcePath, "webpack://")
-	parts := strings.Split(cleanPath, "/")
-	if len(parts) > 0 {
-		cleanPath = strings.Join(parts[1:], "/")
+	for _, rule := range priorityRules {
+		if rule.checkFunc(sourcePath, content) {
+			priority += rule.score
+		}
 	}
-
-	// Check if it has query parameters (like .vue?5d74)
-	hasQuery := strings.Contains(cleanPath, "?")
-
-	// Priority rules (higher = better):
-	// 1. Files WITHOUT query params are usually original source
-	if !hasQuery {
-		priority += 1000
-	}
-
-	// 2. Check content characteristics
-	contentLen := len(content)
-
-	// Original source files are usually longer and more readable
-	if contentLen > 1000 {
-		priority += 100
-	}
-
-	// 3. Check for source code patterns (vs compiled/minified code)
-	if strings.Contains(content, "async ") || strings.Contains(content, "await ") {
-		priority += 50
-	}
-
-	if strings.Contains(content, "export default") {
-		priority += 30
-	}
-
-	// Check for Vue/React component patterns
-	if strings.Contains(content, "mounted()") ||
-		strings.Contains(content, "created()") ||
-		strings.Contains(content, "methods:") {
-		priority += 40
-	}
-
-	// 4. Penalize render functions and compiled code
-	if strings.Contains(content, "var render = function") ||
-		strings.Contains(content, "staticRenderFns") {
-		priority -= 500
-	}
-
-	if strings.Contains(content, "_vm._self._c") {
-		priority -= 300
-	}
-
 	return priority
 }
 
-// processSourceMap extracts and writes source files from a sourcemap with smart priority handling
-func processSourceMap(sm sourceMap, outdir string, concurrency int, verbose bool) (int, error) {
-	log.Printf("[+] Retrieved Sourcemap with version %d, containing %d entries.\n", sm.Version, len(sm.Sources))
+// ============================================================================
+// PATH PROCESSING
+// ============================================================================
 
-	if len(sm.Sources) == 0 {
-		return 0, errors.New("no sources found")
-	}
-
-	if len(sm.SourcesContent) == 0 {
-		return 0, errors.New("no source content found")
-	}
-
-	// Determine how many entries we can safely process
-	maxEntries := len(sm.Sources)
-	if len(sm.SourcesContent) < maxEntries {
-		log.Printf("[!] WARNING: sourcesContent array (%d entries) is shorter than sources array (%d entries).",
-			len(sm.SourcesContent), len(sm.Sources))
-		log.Printf("[!] Only processing the first %d entries that have content available.", len(sm.SourcesContent))
-		maxEntries = len(sm.SourcesContent)
-	} else if len(sm.SourcesContent) > len(sm.Sources) {
-		log.Printf("[!] WARNING: sourcesContent array (%d entries) is longer than sources array (%d entries).",
-			len(sm.SourcesContent), len(sm.Sources))
-		log.Printf("[!] Extra content entries will be ignored.")
-	}
-
-	if sm.Version != 3 {
-		log.Println("[!] Sourcemap is not version 3. This is untested!")
-	}
-
-	if _, err := os.Stat(outdir); os.IsNotExist(err) {
-		err = os.MkdirAll(outdir, 0700)
-		if err != nil {
-			return 0, err
-		}
-	}
-
-	// Phase 1: Analyze and group files by their final output path
-	type fileCandidate struct {
-		sourcePath string
-		content    string
-		priority   int
-		index      int
-	}
-
-	fileGroups := make(map[string][]fileCandidate) // final path -> list of candidates
-
-	for i := 0; i < maxEntries; i++ {
-		sourcePath := normalizeWebpackPath(sm.Sources[i])
-		sourcePath = sanitizePath(sourcePath)
-		sourcePath = strings.TrimPrefix(sourcePath, "/")
-		sourcePath = filepath.Clean(sourcePath)
-
-		if runtime.GOOS == "windows" {
-			sourcePath = cleanWindows(sourcePath)
-		}
-
-		// Calculate the final output path
-		finalPath := filepath.Join(outdir, sourcePath)
-
-		// Calculate priority for this file
-		priority := calculateFilePriority(sm.Sources[i], sm.SourcesContent[i])
-
-		fileGroups[finalPath] = append(fileGroups[finalPath], fileCandidate{
-			sourcePath: sourcePath,
-			content:    sm.SourcesContent[i],
-			priority:   priority,
-			index:      i,
-		})
-	}
-
-	// Phase 2: Create worker pool and submit jobs
-	pool := NewWorkerPool(concurrency, len(fileGroups))
-
-	// Submit jobs - only the highest priority file for each path
-	for finalPath, candidates := range fileGroups {
-		// Find the candidate with highest priority
-		bestCandidate := candidates[0]
-		for _, candidate := range candidates[1:] {
-			if candidate.priority > bestCandidate.priority {
-				bestCandidate = candidate
-			}
-		}
-
-		if verbose && len(candidates) > 1 {
-			log.Printf("[*] Multiple sources for %s: selected source #%d (priority: %d) over %d others",
-				finalPath, bestCandidate.index, bestCandidate.priority, len(candidates)-1)
-			for _, c := range candidates {
-				if c.index != bestCandidate.index {
-					log.Printf("    - Skipped source #%d (priority: %d)", c.index, c.priority)
-				}
-			}
-		}
-
-		pool.Submit(fileWriteJob{
-			path:     finalPath,
-			data:     bestCandidate.content,
-			priority: bestCandidate.priority,
-		})
-	}
-
-	// Phase 3: Collect results
-	go pool.Close() // Close pool in background after all jobs submitted
-
-	processedCount := 0
-	totalJobs := pool.ActiveJobs()
-
-	for i := 0; i < totalJobs; i++ {
-		result := <-pool.Results()
-		if result.success {
-			processedCount++
-		} else {
-			log.Printf("[!] Error writing %s file: %s", result.path, result.err)
-		}
-	}
-
-	log.Printf("[+] Successfully wrote %d unique files (from %d total sources)\n", processedCount, maxEntries)
-	return processedCount, nil
+type PathProcessor struct {
+	isWindows bool
 }
 
-func sanitizePath(path string) string {
-	// Handle common webpack prefixes
+func NewPathProcessor() *PathProcessor {
+	return &PathProcessor{isWindows: runtime.GOOS == "windows"}
+}
+
+func (pp *PathProcessor) Normalize(p string) string {
+	// Handle webpack path with query params
+	dir := filepath.Dir(p)
+	base := filepath.Base(p)
+
+	var name, hash string
+	if strings.Contains(base, "?") {
+		parts := strings.SplitN(base, "?", 2)
+		name = parts[0]
+		hash = parts[1]
+	} else {
+		name = base
+	}
+
+	ext := filepath.Ext(name)
+	nameOnly := strings.TrimSuffix(name, ext)
+
+	if hash != "" {
+		base = fmt.Sprintf("%s_%s%s", nameOnly, hash, ext)
+	} else {
+		base = name
+	}
+
+	if dir == "." {
+		return base
+	}
+	return filepath.Join(dir, base)
+}
+
+func (pp *PathProcessor) Sanitize(path string) string {
+	// Remove webpack prefix
 	if strings.HasPrefix(path, "webpack://") {
 		parts := strings.Split(path, "/")
 		if len(parts) > 2 {
@@ -642,18 +510,19 @@ func sanitizePath(path string) string {
 		}
 	}
 
-	// Replace invalid filename characters (platform-specific)
-	invalidChars := []string{"|", "*", ":", "<", ">", "\""}
-
-	for _, char := range invalidChars {
+	// Replace invalid chars
+	for _, char := range []string{"|", "*", ":", "<", ">", "\""} {
 		path = strings.ReplaceAll(path, char, "_")
 	}
 
 	return path
 }
 
-func cleanWindows(path string) string {
-	// Windows has additional reserved names
+func (pp *PathProcessor) CleanWindows(path string) string {
+	if !pp.isWindows {
+		return path
+	}
+
 	reserved := []string{"CON", "PRN", "AUX", "NUL",
 		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
 		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
@@ -672,136 +541,230 @@ func cleanWindows(path string) string {
 	return strings.Join(parts, string(filepath.Separator))
 }
 
-// isListFile checks if a path is likely a list file based on content or extension
-func isListFile(path string) bool {
-	// Check file extension first
-	ext := strings.ToLower(filepath.Ext(path))
-	if ext == ".txt" || ext == ".list" {
-		return true
-	}
-
-	// For files without these extensions, check content
-	// (only if the file exists locally)
-	if _, err := os.Stat(path); err == nil {
-		// Read first few lines to check format
-		f, err := os.Open(path)
-		if err != nil {
-			return false
-		}
-		defer f.Close()
-
-		scanner := bufio.NewScanner(f)
-		lineCount := 0
-		urlCount := 0
-
-		// Check first 5 lines
-		for scanner.Scan() && lineCount < 5 {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-
-			lineCount++
-			// Check if line looks like a URL or path
-			if strings.HasPrefix(line, "http://") ||
-				strings.HasPrefix(line, "https://") ||
-				strings.HasPrefix(line, "/") ||
-				strings.HasSuffix(line, ".map") ||
-				strings.HasSuffix(line, ".js") {
-				urlCount++
-			}
-		}
-
-		// If most lines look like URLs/paths, treat as list file
-		return urlCount > 0 && float64(urlCount)/float64(lineCount) > 0.5
-	}
-
-	return false
+func (pp *PathProcessor) Process(p string) string {
+	p = pp.Normalize(p)
+	p = pp.Sanitize(p)
+	p = strings.TrimPrefix(p, "/")
+	p = filepath.Clean(p)
+	p = pp.CleanWindows(p)
+	return p
 }
 
-// readURLsFromFile reads URLs from a file and categorizes them
-func readURLsFromFile(path string) (mapURLs []string, jsURLs []string, err error) {
+// ============================================================================
+// SOURCEMAP PROCESSOR
+// ============================================================================
+
+type fileCandidate struct {
+	sourcePath string
+	content    string
+	priority   int
+	index      int
+}
+
+func processSourceMap(sm sourceMap, outdir string, pool *WorkerPool, verbose bool) (int, error) {
+	log.Printf("[+] Retrieved Sourcemap with version %d, containing %d entries.\n", sm.Version, len(sm.Sources))
+
+	if len(sm.Sources) == 0 {
+		return 0, errors.New("no sources found")
+	}
+
+	if len(sm.SourcesContent) == 0 {
+		return 0, errors.New("no source content found")
+	}
+
+	maxEntries := min(len(sm.Sources), len(sm.SourcesContent))
+
+	if len(sm.SourcesContent) != len(sm.Sources) {
+		log.Printf("[!] WARNING: Array length mismatch - sources: %d, content: %d. Processing: %d",
+			len(sm.Sources), len(sm.SourcesContent), maxEntries)
+	}
+
+	if sm.Version != 3 {
+		log.Println("[!] Sourcemap is not version 3. This is untested!")
+	}
+
+	if err := os.MkdirAll(outdir, 0700); err != nil {
+		return 0, err
+	}
+
+	// Group files by output path
+	fileGroups := make(map[string][]fileCandidate)
+	pathProcessor := NewPathProcessor()
+
+	for i := 0; i < maxEntries; i++ {
+		sourcePath := pathProcessor.Process(sm.Sources[i])
+		finalPath := filepath.Join(outdir, sourcePath)
+		priority := calculateFilePriority(sm.Sources[i], sm.SourcesContent[i])
+
+		fileGroups[finalPath] = append(fileGroups[finalPath], fileCandidate{
+			sourcePath: sourcePath,
+			content:    sm.SourcesContent[i],
+			priority:   priority,
+			index:      i,
+		})
+	}
+
+	// Submit best candidate for each path
+	for finalPath, candidates := range fileGroups {
+		best := selectBestCandidate(candidates)
+
+		if verbose && len(candidates) > 1 {
+			logCandidateSelection(finalPath, best, candidates)
+		}
+
+		pool.Submit(fileWriteJob{
+			path:     finalPath,
+			data:     best.content,
+			priority: best.priority,
+		})
+	}
+
+	log.Printf("[+] Queued %d unique files (from %d total sources)\n", len(fileGroups), maxEntries)
+	return len(fileGroups), nil
+}
+
+func selectBestCandidate(candidates []fileCandidate) fileCandidate {
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.priority > best.priority {
+			best = c
+		}
+	}
+	return best
+}
+
+func logCandidateSelection(path string, best fileCandidate, all []fileCandidate) {
+	log.Printf("[*] Multiple sources for %s: selected source #%d (priority: %d) over %d others",
+		path, best.index, best.priority, len(all)-1)
+	for _, c := range all {
+		if c.index != best.index {
+			log.Printf("    - Skipped source #%d (priority: %d)", c.index, c.priority)
+		}
+	}
+}
+
+// ============================================================================
+// FILE OPERATIONS
+// ============================================================================
+
+func writeFile(p, content string) error {
+	p = filepath.Clean(p)
+
+	dir := filepath.Dir(p)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return err
+		}
+	}
+
+	log.Printf("[+] Writing %d bytes to %s.\n", len(content), p)
+	return os.WriteFile(p, []byte(content), 0600)
+}
+
+// ============================================================================
+// URL PROCESSING
+// ============================================================================
+
+func parseHeaders(headers []string) map[string]string {
+	if len(headers) == 0 {
+		return make(map[string]string)
+	}
+
+	headerMap := make(map[string]string)
+	headerString := strings.Join(headers, "\r\n") + "\r\n\r\n"
+
+	r := bufio.NewReader(strings.NewReader(headerString))
+	tpReader := textproto.NewReader(r)
+	mimeHeader, err := tpReader.ReadMIMEHeader()
+
+	if err != nil {
+		log.Printf("[!] Error parsing headers: %v", err)
+		return headerMap
+	}
+
+	for key, values := range mimeHeader {
+		if len(values) > 0 {
+			headerMap[key] = values[0]
+		}
+	}
+
+	return headerMap
+}
+
+func categorizeURL(u string) (isMap bool) {
+	return strings.HasSuffix(u, ".map") || strings.Contains(u, ".map?") ||
+		strings.Contains(u, "sourceMappingURL") || strings.Contains(u, "sourceMap")
+}
+
+func readURLsFromFile(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
 	var urls []string
+	scanner := bufio.NewScanner(f)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-
-		// Skip empty lines and comments
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		urls = append(urls, line)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, nil, err
-	}
-
-	mapURLs, jsURLs = categorizeURLs(urls)
-	return mapURLs, jsURLs, nil
-}
-
-// categorizeURLs splits URLs into sourcemap URLs and JavaScript URLs
-func categorizeURLs(urls []string) (mapURLs []string, jsURLs []string) {
-	for _, u := range urls {
-		// Clean up URL
-		u = strings.TrimSpace(u)
-
-		// Check if it's explicitly a sourcemap URL or JS file
-		if strings.HasSuffix(u, ".map") ||
-			strings.Contains(u, ".map?") {
-			mapURLs = append(mapURLs, u)
-		} else if strings.HasSuffix(u, ".js") ||
-			strings.Contains(u, ".js?") {
-			jsURLs = append(jsURLs, u)
-		} else {
-			// For ambiguous cases, check content
-			if strings.Contains(u, "sourceMappingURL") || strings.Contains(u, "sourceMap") {
-				mapURLs = append(mapURLs, u)
-			} else {
-				// Default to JS
-				jsURLs = append(jsURLs, u)
-			}
+		if line != "" && !strings.HasPrefix(line, "#") {
+			urls = append(urls, line)
 		}
 	}
-	return mapURLs, jsURLs
+
+	return urls, scanner.Err()
 }
 
-// readURLsFromStdin reads URLs from stdin for pipeline integration
 func readURLsFromStdin() ([]string, error) {
 	var urls []string
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-
-		// Skip empty lines
-		if line == "" {
-			continue
+		if line != "" {
+			urls = append(urls, line)
 		}
-
-		urls = append(urls, line)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return urls, nil
+	return urls, scanner.Err()
 }
 
-// deduplicateURLs removes duplicate URLs while preserving order
+func isListFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".txt" || ext == ".list" {
+		return true
+	}
+
+	// Check file content
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+
+	urls, err := readURLsFromFile(path)
+	if err != nil {
+		return false
+	}
+
+	if len(urls) == 0 {
+		return false
+	}
+
+	// Check if most lines look like URLs
+	urlCount := 0
+	for _, u := range urls {
+		if strings.HasPrefix(u, "http") || strings.HasPrefix(u, "/") ||
+			strings.HasSuffix(u, ".map") || strings.HasSuffix(u, ".js") {
+			urlCount++
+		}
+	}
+
+	return float64(urlCount)/float64(len(urls)) > 0.5
+}
+
 func deduplicateURLs(urls []string) []string {
-	seen := make(map[string]bool)
-	var unique []string
+	seen := make(map[string]bool, len(urls))
+	unique := make([]string, 0, len(urls))
 
 	for _, url := range urls {
 		if !seen[url] {
@@ -813,45 +776,56 @@ func deduplicateURLs(urls []string) []string {
 	return unique
 }
 
-// processInput handles all input sources and returns categorized URLs
-func processInput(inputs []string, silent bool) (mapURLs []string, jsURLs []string, err error) {
-	var allMapURLs []string
-	var allJsURLs []string
+func processInput(inputs []string, silent bool) (mapURLs, jsURLs []string, err error) {
+	var allURLs []string
 
 	for _, input := range inputs {
-		// Check if input is a list file
 		if isListFile(input) {
-			mapURLsFromFile, jsURLsFromFile, err := readURLsFromFile(input)
+			urls, err := readURLsFromFile(input)
 			if err != nil {
 				return nil, nil, err
 			}
-
-			allMapURLs = append(allMapURLs, mapURLsFromFile...)
-			allJsURLs = append(allJsURLs, jsURLsFromFile...)
+			allURLs = append(allURLs, urls...)
 
 			if !silent {
-				log.Printf("[+] Loaded %d URLs from list file %s (%d sourcemaps, %d JavaScript)\n",
-					len(mapURLsFromFile)+len(jsURLsFromFile), input, len(mapURLsFromFile), len(jsURLsFromFile))
+				log.Printf("[+] Loaded %d URLs from list file %s\n", len(urls), input)
 			}
 		} else {
-			// Treat as direct URL/path
-			mapURLsDirect, jsURLsDirect := categorizeURLs([]string{input})
-			allMapURLs = append(allMapURLs, mapURLsDirect...)
-			allJsURLs = append(allJsURLs, jsURLsDirect...)
+			allURLs = append(allURLs, input)
 		}
 	}
 
-	return allMapURLs, allJsURLs, nil
+	// Categorize
+	for _, u := range allURLs {
+		if categorizeURL(u) {
+			mapURLs = append(mapURLs, u)
+		} else {
+			jsURLs = append(jsURLs, u)
+		}
+	}
+
+	return mapURLs, jsURLs, nil
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {
 	opts := &options{}
 
 	flagSet := goflags.NewFlagSet()
-	flagSet.SetDescription("Extract source code from JavaScript sourcemaps (OPTIMIZED VERSION)")
+	flagSet.SetDescription("Extract source code from JavaScript sourcemaps (FULLY OPTIMIZED)")
 
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringSliceVarP(&opts.URLs, "url", "u", nil, "URL/path to .map/.js file or list file (comma-separated)", goflags.CommaSeparatedStringSliceOptions),
+		flagSet.StringSliceVarP(&opts.URLs, "url", "u", nil, "URL/path to .map/.js file or list file", goflags.CommaSeparatedStringSliceOptions),
 		flagSet.StringVarP(&opts.List, "list", "l", "", "file containing URLs (one per line)"),
 	)
 
@@ -866,7 +840,7 @@ func main() {
 		flagSet.IntVarP(&opts.RateLimit, "rate-limit", "rl", 0, "requests per second (0 = unlimited)"),
 		flagSet.IntVarP(&opts.Concurrency, "concurrency", "c", 5, "concurrent file writes"),
 		flagSet.BoolVarP(&opts.Insecure, "insecure", "k", true, "skip TLS verification"),
-		flagSet.StringSliceVarP(&opts.Headers, "header", "H", nil, "custom HTTP headers (can be used multiple times)", goflags.CommaSeparatedStringSliceOptions),
+		flagSet.StringSliceVarP(&opts.Headers, "header", "H", nil, "custom HTTP headers", goflags.CommaSeparatedStringSliceOptions),
 	)
 
 	flagSet.CreateGroup("debug", "Debug",
@@ -878,22 +852,18 @@ func main() {
 		log.Fatalf("Error parsing flags: %s", err)
 	}
 
-	// Validation
 	if opts.Output == "" {
 		log.Fatal("output directory is required (-o)")
 	}
 
+	// Collect inputs
 	var allInputs []string
-
-	// Collect all inputs
 	allInputs = append(allInputs, opts.URLs...)
 
-	// Add list file if provided
 	if opts.List != "" {
 		allInputs = append(allInputs, opts.List)
 	}
 
-	// Read from stdin if requested
 	if opts.Stdin {
 		stdinURLs, err := readURLsFromStdin()
 		if err != nil {
@@ -906,7 +876,7 @@ func main() {
 		log.Fatal("at least one input is required (-u or -l)")
 	}
 
-	// Process all input sources
+	// Process input
 	mapURLs, jsURLs, err := processInput(allInputs, opts.Silent)
 	if err != nil {
 		log.Fatalf("Error processing input: %v", err)
@@ -916,9 +886,8 @@ func main() {
 		log.Fatal("no valid URLs/paths found in input")
 	}
 
-	// Deduplicate URLs
-	allURLs := append(mapURLs, jsURLs...)
-	originalCount := len(allURLs)
+	// Deduplicate
+	originalCount := len(mapURLs) + len(jsURLs)
 	mapURLs = deduplicateURLs(mapURLs)
 	jsURLs = deduplicateURLs(jsURLs)
 
@@ -926,11 +895,11 @@ func main() {
 		log.Printf("[+] Removed %d duplicate URLs\n", originalCount-(len(mapURLs)+len(jsURLs)))
 	}
 
-	if !opts.Silent && (len(mapURLs) > 0 || len(jsURLs) > 0) {
+	if !opts.Silent {
 		log.Printf("[+] Total: %d sourcemap URLs, %d JavaScript URLs\n", len(mapURLs), len(jsURLs))
 	}
 
-	// Parse proxy URL
+	// Setup HTTP client
 	var proxyURL *url.URL
 	if opts.Proxy != "" {
 		proxyURL, err = url.Parse(opts.Proxy)
@@ -939,14 +908,12 @@ func main() {
 		}
 	}
 
-	// Parse headers
 	headerMap := parseHeaders(opts.Headers)
 	if len(headerMap) > 0 && opts.Verbose {
 		log.Printf("[+] Using %d custom header(s)\n", len(headerMap))
 	}
 
-	// Create HTTP client config
-	httpCfg := httpClientConfig{
+	client := newHTTPClient(httpClientConfig{
 		timeout:      time.Duration(opts.Timeout) * time.Second,
 		retries:      opts.Retries,
 		insecure:     opts.Insecure,
@@ -954,21 +921,18 @@ func main() {
 		headers:      headerMap,
 		followRedirs: true,
 		maxRedirs:    10,
-	}
-
-	// Create retryable HTTP client
-	client := newHTTPClient(httpCfg)
+	})
 
 	if opts.Verbose {
 		log.Printf("[+] HTTP Client configured: timeout=%ds, retries=%d, insecure=%v\n",
 			opts.Timeout, opts.Retries, opts.Insecure)
 	}
 
-	totalProcessed := 0
-	totalFailed := 0
-	totalSources := 0
+	// Create worker pool (reused for all sourcemaps)
+	totalURLs := len(mapURLs) + len(jsURLs)
+	pool := NewWorkerPool(opts.Concurrency, totalURLs*10)
 
-	// Rate limiter setup
+	// Rate limiter
 	var rateLimiter <-chan time.Time
 	if opts.RateLimit > 0 {
 		if opts.Verbose {
@@ -979,97 +943,87 @@ func main() {
 		rateLimiter = ticker.C
 	}
 
-	// Process sourcemap URLs
-	for idx, sourceURL := range mapURLs {
-		// Rate limiting
+	totalProcessed := 0
+	totalFailed := 0
+
+	// Process all URLs
+	allSources := make([]struct {
+		url   string
+		isMap bool
+	}, 0, totalURLs)
+
+	for _, u := range mapURLs {
+		allSources = append(allSources, struct {
+			url   string
+			isMap bool
+		}{u, true})
+	}
+
+	for _, u := range jsURLs {
+		allSources = append(allSources, struct {
+			url   string
+			isMap bool
+		}{u, false})
+	}
+
+	// Start result collector in background
+	resultsDone := make(chan struct{})
+	var successCount int
+
+	go func() {
+		for result := range pool.Results() {
+			if result.success {
+				successCount++
+			} else {
+				log.Printf("[!] Error writing %s: %s", result.path, result.err)
+			}
+		}
+		close(resultsDone)
+	}()
+
+	// Process sources
+	for idx, source := range allSources {
 		if rateLimiter != nil {
 			<-rateLimiter
 		}
 
 		if !opts.Silent {
-			log.Printf("\n[*] Processing sourcemap %d/%d: %s\n", idx+1, len(mapURLs), sourceURL)
+			log.Printf("\n[*] Processing %d/%d: %s\n", idx+1, totalURLs, source.url)
 		}
 
-		sm, err := getSourceMap(sourceURL, client, headerMap)
+		var sm sourceMap
+		var err error
+
+		if source.isMap {
+			sm, err = fetchAndParseSourceMap(source.url, client, headerMap)
+		} else {
+			sm, err = getSourceMapFromJS(source.url, client, headerMap)
+		}
+
 		if err != nil {
-			log.Printf("[!] Failed to retrieve sourcemap from %s: %v\n", sourceURL, err)
+			log.Printf("[!] Failed: %v\n", err)
 			totalFailed++
 			continue
 		}
 
-		processed, err := processSourceMap(sm, opts.Output, opts.Concurrency, opts.Verbose)
+		processed, err := processSourceMap(sm, opts.Output, pool, opts.Verbose)
 		if err != nil {
-			log.Printf("[!] Failed to process sourcemap from %s: %v\n", sourceURL, err)
-			totalFailed++
-			continue
-		}
-
-		totalProcessed += processed
-		totalSources++
-	}
-
-	// Process JavaScript URLs
-	for idx, jsURL := range jsURLs {
-		// Rate limiting
-		if rateLimiter != nil {
-			<-rateLimiter
-		}
-
-		if !opts.Silent {
-			log.Printf("\n[*] Processing JavaScript %d/%d: %s\n", idx+1, len(jsURLs), jsURL)
-		}
-
-		sm, err := getSourceMapFromJS(jsURL, client, headerMap)
-		if err != nil {
-			log.Printf("[!] Failed to retrieve sourcemap from %s: %v\n", jsURL, err)
-			totalFailed++
-			continue
-		}
-
-		processed, err := processSourceMap(sm, opts.Output, opts.Concurrency, opts.Verbose)
-		if err != nil {
-			log.Printf("[!] Failed to process sourcemap from %s: %v\n", jsURL, err)
+			log.Printf("[!] Failed to process: %v\n", err)
 			totalFailed++
 			continue
 		}
 
 		totalProcessed += processed
-		totalSources++
 	}
+
+	// Close pool and wait for all results to be processed
+	pool.Close()
+	<-resultsDone
 
 	if !opts.Silent {
 		log.Println("\n" + strings.Repeat("=", 60))
-		log.Printf("[+] SUMMARY: Processed %d sourcemaps successfully, %d failed", totalSources, totalFailed)
-		log.Printf("[+] Total source files extracted: %d", totalProcessed)
+		log.Printf("[+] SUMMARY: Processed %d sources, %d failed", totalURLs-totalFailed, totalFailed)
+		log.Printf("[+] Successfully wrote %d files", successCount)
 		log.Println("[+] Done")
 	}
-}
-
-func normalizeWebpackPath(p string) string {
-	dir := filepath.Dir(p)
-	base := filepath.Base(p) // App.vue?5d74
-
-	var name, hash string
-	if strings.Contains(base, "?") {
-		split := strings.SplitN(base, "?", 2)
-		name = split[0]
-		hash = split[1]
-	} else {
-		name = base
-	}
-
-	ext := filepath.Ext(name)
-	nameOnly := strings.TrimSuffix(name, ext)
-
-	if hash != "" {
-		base = fmt.Sprintf("%s_%s%s", nameOnly, hash, ext)
-	} else {
-		base = name
-	}
-
-	// GHÉP LẠI path
-	if dir == "." {
-		return base
-	}
-	return filepath.Join(dir, base)
 }
