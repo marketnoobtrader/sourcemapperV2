@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/projectdiscovery/goflags"
 	"github.com/projectdiscovery/retryablehttp-go"
 )
@@ -214,7 +214,7 @@ func getSourceMap(source string, client *retryablehttp.Client, headers map[strin
 
 	// Unmarshal the body into the struct.
 	log.Printf("[+] Read %d bytes, parsing JSON.\n", len(body))
-	err = json.Unmarshal(body, &m)
+	err = sonic.Unmarshal(body, &m)
 
 	if err != nil {
 		log.Printf("[!] Error parsing JSON - confirm %s is a valid JS sourcemap", source)
