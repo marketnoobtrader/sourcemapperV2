@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -525,13 +526,13 @@ func isListFile(path string) bool {
 
 // readURLsFromFile reads URLs from file and categorizes them
 func readURLsFromFile(filename string) (mapURLs []string, jsURLs []string, err error) {
-	file, err := os.Open(filename)
+	data, err, unmap := readFileSmart(filename)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer file.Close()
+	defer unmap()
 
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	lineNum := 0
 
 	for scanner.Scan() {
